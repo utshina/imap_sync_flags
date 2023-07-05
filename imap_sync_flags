@@ -1,0 +1,185 @@
+#!/usr/bin/python3
+import sys
+import re
+import logging
+import argparse
+import getpass
+import imaplib
+import email
+import email.policy
+import datetime
+import unicodedata
+
+builtin_flags = {
+    'thunderbird': [None, '$label1', '$label2', '$label3', '$label4', '$label5'],
+    'mail_app': [None, '$MailFlagBit0', '$MailFlagBit1', '$MailFlagBit2', '$MailFlagBit3', '$MailFlagBit4', '$MailFlagBit5'],
+}
+
+# ----------
+# copied from https://stackoverflow.com/questions/12776679/imap-folder-path-encoding-imap-utf-7-for-python
+# Thanks to Frédéric Grosshans for putting the code in the public domain.
+#
+import base64
+
+def b64padanddecode(b):
+    """Decode unpadded base64 data"""
+    b+=(-len(b)%4)*'=' #base64 padding (if adds '===', no valid padding anyway)
+    return base64.b64decode(b,altchars='+,',validate=True).decode('utf-16-be')
+
+def imaputf7decode(s):
+    """Decode a string encoded according to RFC2060 aka IMAP UTF7.
+
+Minimal validation of input, only works with trusted data"""
+    lst=s.split('&')
+    out=lst[0]
+    for e in lst[1:]:
+        u,a=e.split('-',1) #u: utf16 between & and 1st -, a: ASCII chars folowing it
+        if u=='' : out+='&'
+        else: out+=b64padanddecode(u)
+        out+=a
+    return out
+
+def imaputf7encode(s):
+    """"Encode a string into RFC2060 aka IMAP UTF7"""
+    s=s.replace('&','&-')
+    iters=iter(s)
+    unipart=out=''
+    for c in s:
+        if 0x20<=ord(c)<=0x7f :
+            if unipart!='' :
+                out+='&'+base64.b64encode(unipart.encode('utf-16-be')).decode('ascii').rstrip('=')+'-'
+                unipart=''
+            out+=c
+        else : unipart+=c
+    if unipart!='' :
+        out+='&'+base64.b64encode(unipart.encode('utf-16-be')).decode('ascii').rstrip('=')+'-'
+    return out
+# ----------
+
+def format_date(date):
+    d = email.utils.parsedate_tz(date)
+    t = email.utils.mktime_tz(d)
+    d = datetime.datetime.fromtimestamp(t)
+    return d.isoformat()
+
+def format_unicode(text, width):
+    count = 0
+    output = ''
+    for c in text:
+        wide = unicodedata.east_asian_width(c) in 'FW'
+        count += 2 if wide else 1
+        if width < count:
+            break
+        output += c
+    if width > count:
+        output += ' ' * (width - count)
+    return output
+
+def print_list(imap, nums):
+    for num in nums:
+        result, data = imap.fetch(num, '(BODY.PEEK[HEADER])')
+        headers = email.message_from_bytes(data[0][1], policy=email.policy.default)
+        msg_date = format_date(headers['Date'])
+        addr = email.utils.parseaddr(headers['From'])
+        msg_from = format_unicode(addr[0] or addr[1], 20)
+        msg_subject = format_unicode(headers['Subject'], 40)
+        # num = str(num, 'UTF-8')
+        num = num.decode()
+        logging.info(f'{num:>5} {msg_date} {msg_from} {msg_subject}')
+
+def search_and_store_flags(imap, command, flag1, flag2, dry_run):
+    result, data = imap.search(None, 'KEYWORD ' + flag1)
+    logging.debug(f'IMAP searh {flag1} = {result}')
+    nums = data[0].split()
+    flags = flag2 + ' \Flagged' if command == '+FLAGS' else flag2
+    for num in nums:
+        if not dry_run:
+            imap.store(num, command, flags)
+            logging.debug(f'IMAP store {num} {command} {flags}')
+    if logging.root.level > logging.INFO:
+        return
+    logging.info(f'found {len(nums)} E-mails with the flag "{flag1}"')
+    if len(nums) > 0:
+        verb = 'set' if command == '+FLAGS' else 'clear'
+        logging.info(f'{verb} the flag "{flag2}"')
+        print_list(imap, nums)
+
+
+def main():
+    # parse arguments
+    parser = argparse.ArgumentParser(description='Synchronize E-mail flags in IMAP folders')
+    parser.add_argument('--username', '-u', help='specify the IMAP user name')
+    parser.add_argument('--password', help='specify the IMAP password')
+    parser.add_argument('--port', '-p', type=int, help="specify the port number of the IMAP server")
+    parser.add_argument('--tls', choices=['no', 'start', 'yes'], default='yes', help='no: use no TLS, start: use STARTTLS, yes: use TLS')
+    parser.add_argument('--folder', action='append', help='specify the IMAP folder (multiple times) [default=INBOX]')
+    parser.add_argument('--all-folders', '-a', action='store_true', help='specify all folders')
+    parser.add_argument('--flags', '-f', action='append', nargs=2, default='', metavar=('FLAG1', 'FLAG2'), help='specify FLAG1 and FLAG2 (multiple times)')
+    parser.add_argument('--mode', '-m', choices=['sync', 'copy', 'move'], default='sync', help='sync: FLAG1 <-> FLAG2, copy: FLAG1 -> FLAG2, move: copy and clear FLAG1')
+    parser.add_argument('--dry-run', '-n', action='store_true', help='do not actually store flags')
+    parser.add_argument('--verbose', '-v', action='count', default=0)
+    parser.add_argument('hostname', help='specify the host name of the IMAP server')
+    args = parser.parse_args()
+
+    # setup logging
+    if args.verbose == 0:
+        level = logging.WARNING
+    elif args.verbose == 1:
+        level = logging.INFO
+    else:
+        level = logging.DEBUG
+    logging.basicConfig(format='%(levelname)s: %(message)s', level=level)
+
+    # set default args
+    folders = args.folder or ['INBOX']
+    flags = [
+        [ builtin_flags['thunderbird'][4], builtin_flags['mail_app'][1] ]
+    ]
+    logging.debug(args)
+
+    # setup IMAP connection
+    if args.tls == 'yes':
+        port = args.port or imaplib.IMAP4_SSL_PORT
+        imap = imaplib.IMAP4_SSL(args.hostname, port)
+    else:
+        port = args.port or imaplib.IMAP4_PORT
+        imap = imaplib.IMAP4(args.hostname, port)
+        if args.tls == 'start':
+            imap.starttls()
+    imap.debug = args.verbose
+    logging.debug(f'IMAP connect to {args.hostname}:{port}')
+
+    # login
+    username = args.username or input('Username: ')
+    password = args.password or getpass.getpass()
+    imap.login(username, password)
+    logging.debug(f'IMAP login with {username}')
+
+    # list folders
+    if args.all_folders:
+        result, data = imap.list()
+        logging.debug(f'IMAP list = {result}')
+        folders = [re.sub('^\(.*\) "." ', '', s.decode()) for s in data]
+    else:
+        folders = [imaputf7encode(s) for s in folders]
+
+    # iterate folders
+    dry_run = args.dry_run
+    for folder in folders:
+        logging.info(f'search the folder "{imaputf7decode(folder)}":')
+        result, data = imap.select(folder)
+        logging.debug(f'IMAP select {folder} = {result}')
+        if result != 'OK':
+            logging.warning(f'IMAP cannot select the folder "{folder}"')
+            continue
+        for flag1, flag2 in flags:
+            search_and_store_flags(imap, '+FLAGS', flag1, flag2, dry_run)
+            if args.mode == 'sync':
+                search_and_store_flags(imap, '+FLAGS', flag2, flag1, dry_run)
+            elif args.mode == 'move':
+                search_and_store_flags(imap, '-FLAGS', flag1, flag1, dry_run)
+    imap.close()
+    imap.logout()
+
+if __name__ == '__main__':
+    main()
